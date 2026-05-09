@@ -13,10 +13,36 @@ import { EDGAR_BASE, EDGAR_SEARCH, USER_AGENT } from "../config";
 //   B. EFTS full-text search fallback — if index fetch fails
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PROXY_PRIMARY = "https://corsproxy.io/?";
+const PROXY_PRIMARY = "https://corsproxy.io/?url=";
 const PROXY_FALLBACK = "https://api.allorigins.win/raw?url=";
+const IS_DEV = import.meta.env.DEV;
+
+function toDevProxy(url) {
+  // Route www.sec.gov/Archives through Vite dev proxy
+  if (url.includes("www.sec.gov/Archives")) {
+    return url.replace("https://www.sec.gov/Archives", "/sec-archives");
+  }
+  // Route efts.sec.gov through Vite dev proxy
+  if (url.includes("efts.sec.gov")) {
+    return url.replace("https://efts.sec.gov", "/sec-efts");
+  }
+  return null;
+}
 
 async function proxyFetch(url) {
+  // In dev, use Vite's server proxy to avoid CORS entirely
+  if (IS_DEV) {
+    const devUrl = toDevProxy(url);
+    if (devUrl) {
+      try {
+        const r = await fetch(devUrl);
+        if (r.ok) return r.text();
+      } catch {
+        /* fall through to external proxies */
+      }
+    }
+  }
+
   try {
     const r = await fetch(`${PROXY_PRIMARY}${encodeURIComponent(url)}`);
     if (r.ok) return r.text();
@@ -132,20 +158,9 @@ async function fetchQuarterlyIndex(year, quarter, cutoffDate) {
 // ── EFTS fallback — get CIKs from search index ───────────────────────────────
 
 async function getCIKsFromEFTS(startDate) {
-  // Correct EFTS params: q is required, use empty string workaround
-  const params = new URLSearchParams({
-    q: '""',
-    forms: "4",
-    dateRange: "custom",
-    startdt: startDate,
-    hits_hits_total_value: "true",
-  });
-
-  // The actual working URL format (confirmed from tldrfiling.com guide)
   const url = `${EDGAR_SEARCH}?q=%22%22&forms=4&dateRange=custom&startdt=${startDate}`;
 
-  try {
-    const data = await edgarJson(url);
+  const parseEFTS = (data) => {
     const hits = data?.hits?.hits || [];
     return hits
       .map((h) => ({
@@ -155,6 +170,23 @@ async function getCIKsFromEFTS(startDate) {
         accessionNumber: h._id || "",
       }))
       .filter((r) => r.cik);
+  };
+
+  // In dev, route through Vite proxy; otherwise try direct (efts.sec.gov has CORS headers)
+  const fetchUrl = IS_DEV ? (toDevProxy(url) ?? url) : url;
+  try {
+    const data = await edgarJson(fetchUrl);
+    const results = parseEFTS(data);
+    if (results.length > 0) return results;
+  } catch {
+    /* fall through to external proxy */
+  }
+
+  // Last resort: external proxy
+  try {
+    const text = await proxyFetch(url);
+    const data = JSON.parse(text);
+    return parseEFTS(data);
   } catch {
     return [];
   }

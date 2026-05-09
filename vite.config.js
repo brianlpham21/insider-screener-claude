@@ -3,4 +3,18 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  server: {
+    proxy: {
+      "/sec-archives": {
+        target: "https://www.sec.gov",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/sec-archives/, "/Archives"),
+      },
+      "/sec-efts": {
+        target: "https://efts.sec.gov",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/sec-efts/, ""),
+      },
+    },
+  },
 });
