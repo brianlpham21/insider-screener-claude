@@ -1,97 +1,225 @@
-// import { EDGAR_BASE, EDGAR_BROWSE, EDGAR_SEARCH, USER_AGENT, CORS_PROXY } from "../config";
+import { EDGAR_BASE, EDGAR_SEARCH, USER_AGENT } from "../config";
 
-// export async function fetchSubmissions(cik) {
-//   const paddedCik = String(cik).padStart(10, "0");
-//   const resp = await fetch(`${EDGAR_BASE}/submissions/CIK${paddedCik}.json`, {
-//     headers: { "User-Agent": USER_AGENT },
-//   });
-//   if (!resp.ok) return null;
-//   return resp.json();
-// }
+// ─────────────────────────────────────────────────────────────────────────────
+// Architecture notes:
+//
+// 1. data.sec.gov  — sends CORS headers → fetch directly, no proxy needed
+// 2. efts.sec.gov  — sends CORS headers → fetch directly, no proxy needed
+// 3. www.sec.gov/Archives (XML filings) — needs proxy
+//
+// CIK seeding strategy (most → least reliable):
+//   A. EDGAR daily index files (form.idx) — definitive list of every Form 4
+//      filed each day, with CIK + accession number. No guessing.
+//   B. EFTS full-text search fallback — if index fetch fails
+// ─────────────────────────────────────────────────────────────────────────────
 
-// export async function fetchCompanyFacts(cik) {
-//   const paddedCik = String(cik).padStart(10, "0");
-//   const resp = await fetch(`${EDGAR_BASE}/api/xbrl/companyfacts/CIK${paddedCik}.json`, {
-//     headers: { "User-Agent": USER_AGENT },
-//   });
-//   if (!resp.ok) return null;
-//   return resp.json();
-// }
+const PROXY_PRIMARY = "https://corsproxy.io/?";
+const PROXY_FALLBACK = "https://api.allorigins.win/raw?url=";
 
-// export async function fetchRecentForm4CIKs(startDate) {
-//   const url = `${EDGAR_BROWSE}?action=getcurrent&type=4&dateb=&owner=include&count=100&search_text=`;
-//   const resp = await fetch(`${CORS_PROXY}${encodeURIComponent(url)}`, {
-//     headers: { "User-Agent": USER_AGENT },
-//   });
-//   if (!resp.ok) throw new Error(`EDGAR browse failed: ${resp.status}`);
-//   const html = await resp.text();
-//   const matches = [...html.matchAll(/\/cgi-bin\/browse-edgar\?action=getcompany&CIK=(\d+)/g)];
-//   return [...new Set(matches.map((m) => m[1]))].slice(0, 40);
-// }
-
-// export async function fetchEdgarSearchCount(startDate) {
-//   const url = `${EDGAR_SEARCH}?forms=4&dateRange=custom&startdt=${startDate}&hits.hits.total.value=true`;
-//   const resp = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
-//   if (!resp.ok) throw new Error(`EDGAR search failed: ${resp.status}`);
-//   return resp.json();
-// }
-
-// export function parseForm4XML(xmlText) {
-//   const parser = new DOMParser();
-//   const doc = parser.parseFromString(xmlText, "text/xml");
-//   const transactions = [];
-
-//   doc.querySelectorAll("nonDerivativeTransaction").forEach((t) => {
-//     const code = t.querySelector("transactionCode")?.textContent?.trim();
-//     if (code !== "P") return;
-//     const shares = parseFloat(t.querySelector("transactionShares value")?.textContent || "0");
-//     const price = parseFloat(t.querySelector("transactionPricePerShare value")?.textContent || "0");
-//     const date = t.querySelector("transactionDate value")?.textContent?.trim();
-//     const sharesOwned = parseFloat(
-//       t.querySelector("sharesOwnedFollowingTransaction value")?.textContent || "0"
-//     );
-//     if (shares > 0 && price > 0) {
-//       transactions.push({ code, shares, price, date, sharesOwned, value: shares * price });
-//     }
-//   });
-
-//   return {
-//     issuer: doc.querySelector("issuerName")?.textContent?.trim() || "",
-//     ticker: doc.querySelector("issuerTradingSymbol")?.textContent?.trim() || "",
-//     insiderName: doc.querySelector("rptOwnerName")?.textContent?.trim() || "",
-//     insiderTitle: doc.querySelector("officerTitle")?.textContent?.trim() || "",
-//     isOfficer: doc.querySelector("isOfficer")?.textContent?.trim() === "1",
-//     isDirector: doc.querySelector("isDirector")?.textContent?.trim() === "1",
-//     transactions,
-//   };
-// }
-
-import { EDGAR_BASE, EDGAR_SEARCH, USER_AGENT, CORS_PROXY } from "../config";
-
-// ── Low-level fetch helpers ───────────────────────────────────────────────────
-
-function edgarHeaders() {
-  return { "User-Agent": USER_AGENT };
+async function proxyFetch(url) {
+  try {
+    const r = await fetch(`${PROXY_PRIMARY}${encodeURIComponent(url)}`);
+    if (r.ok) return r.text();
+  } catch {
+    /* fall through */
+  }
+  try {
+    const r = await fetch(`${PROXY_FALLBACK}${encodeURIComponent(url)}`);
+    if (r.ok) return r.text();
+  } catch {
+    /* fall through */
+  }
+  throw new Error(`Proxy failed: ${url}`);
 }
 
-async function edgarGet(url) {
-  const resp = await fetch(url, { headers: edgarHeaders() });
-  if (!resp.ok) throw new Error(`EDGAR ${resp.status}: ${url}`);
-  return resp.json();
+async function edgarJson(url) {
+  const r = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
+  if (!r.ok) throw new Error(`EDGAR ${r.status}: ${url}`);
+  return r.json();
 }
 
-async function proxyGet(url) {
-  const resp = await fetch(`${CORS_PROXY}${encodeURIComponent(url)}`);
-  if (!resp.ok) throw new Error(`Proxy ${resp.status}`);
-  return resp.text();
+// ── EDGAR daily index ─────────────────────────────────────────────────────────
+// Returns array of { cik, company, accessionNumber, filingDate }
+// for every Form 4 filed within the lookback window.
+// Uses the quarterly form.idx files which are the authoritative record.
+
+function getQuarterDates(date) {
+  const m = date.getMonth(); // 0-indexed
+  const q = Math.floor(m / 3) + 1;
+  return { year: date.getFullYear(), quarter: q };
 }
 
-// ── EDGAR submissions & facts ─────────────────────────────────────────────────
+async function fetchDailyIndexForDate(dateStr) {
+  // dateStr: "YYYY-MM-DD"
+  // EDGAR daily index: /Archives/edgar/daily-index/YYYY/QTRN/form-YYYYMMDD.idx
+  const [y, mo, d] = dateStr.split("-");
+  const q = Math.ceil(parseInt(mo) / 3);
+  const url = `https://www.sec.gov/Archives/edgar/daily-index/${y}/QTR${q}/form${y}${mo}${d}.idx`;
+
+  try {
+    const text = await proxyFetch(url);
+    if (!text || text.startsWith("<!DOCTYPE")) return [];
+    return parseDailyIdx(text, dateStr);
+  } catch {
+    return [];
+  }
+}
+
+function parseDailyIdx(text, fileDate) {
+  // idx format (fixed-width after a header):
+  // Form Type  |Company Name            |CIK       |Date Filed|Filename
+  const lines = text.split("\n");
+  const results = [];
+
+  // Skip header lines (first ~10 lines)
+  let dataStarted = false;
+  for (const line of lines) {
+    if (line.startsWith("---")) {
+      dataStarted = true;
+      continue;
+    }
+    if (!dataStarted) continue;
+    if (!line.trim()) continue;
+
+    // Form type is in first column (fixed width ~12 chars)
+    const formType = line.substring(0, 12).trim();
+    if (formType !== "4") continue;
+
+    // CIK is ~10 chars starting at position ~62
+    // But widths vary — split on multiple spaces
+    const parts = line.trim().split(/\s{2,}/);
+    if (parts.length < 4) continue;
+
+    const form = parts[0];
+    if (form !== "4") continue;
+
+    const company = parts[1];
+    const cik = parts[2];
+    const date = parts[3];
+    const filename = parts[4] || "";
+
+    // Extract accession number from filename like edgar/data/12345/0001234567-24-000001.txt
+    const accMatch = filename.match(/(\d{10}-\d{2}-\d{6})/);
+    if (!accMatch) continue;
+
+    results.push({
+      cik,
+      company,
+      filingDate: date || fileDate,
+      accessionNumber: accMatch[1],
+    });
+  }
+  return results;
+}
+
+// ── Quarterly index fallback ──────────────────────────────────────────────────
+// If daily index isn't available (weekend, holiday), use the quarterly form.idx
+
+async function fetchQuarterlyIndex(year, quarter, cutoffDate) {
+  const url = `https://www.sec.gov/Archives/edgar/full-index/${year}/QTR${quarter}/form.idx`;
+  try {
+    const text = await proxyFetch(url);
+    if (!text || text.startsWith("<!DOCTYPE")) return [];
+    const all = parseDailyIdx(text, "");
+    return all.filter(
+      (r) => !cutoffDate || new Date(r.filingDate) >= cutoffDate,
+    );
+  } catch {
+    return [];
+  }
+}
+
+// ── EFTS fallback — get CIKs from search index ───────────────────────────────
+
+async function getCIKsFromEFTS(startDate) {
+  // Correct EFTS params: q is required, use empty string workaround
+  const params = new URLSearchParams({
+    q: '""',
+    forms: "4",
+    dateRange: "custom",
+    startdt: startDate,
+    hits_hits_total_value: "true",
+  });
+
+  // The actual working URL format (confirmed from tldrfiling.com guide)
+  const url = `${EDGAR_SEARCH}?q=%22%22&forms=4&dateRange=custom&startdt=${startDate}`;
+
+  try {
+    const data = await edgarJson(url);
+    const hits = data?.hits?.hits || [];
+    return hits
+      .map((h) => ({
+        cik: String(h._source?.entity_id || "").replace(/^0+/, "") || null,
+        company: h._source?.entity_name || "",
+        filingDate: h._source?.file_date || startDate,
+        accessionNumber: h._id || "",
+      }))
+      .filter((r) => r.cik);
+  } catch {
+    return [];
+  }
+}
+
+// ── Main CIK + accession seeder ───────────────────────────────────────────────
+// Tries daily index files for each day in the lookback window, then quarterly
+// index, then EFTS as a last resort.
+
+export async function getRecentForm4Filings(startDate, onLog) {
+  const cutoff = new Date(startDate);
+  const today = new Date();
+  const filings = [];
+
+  // Walk back day by day, fetch each day's index
+  onLog("📅 Loading EDGAR daily index files...");
+  const dayMs = 86400000;
+  let failures = 0;
+
+  for (let d = new Date(today); d >= cutoff; d = new Date(d - dayMs)) {
+    const dateStr = d.toISOString().split("T")[0];
+    const dayOfWeek = d.getDay();
+    if (dayOfWeek === 0 || dayOfWeek === 6) continue; // skip weekends
+
+    const dayFilings = await fetchDailyIndexForDate(dateStr);
+    filings.push(...dayFilings);
+
+    if (dayFilings.length === 0) failures++;
+    await new Promise((r) => setTimeout(r, 80));
+  }
+
+  if (filings.length > 0) {
+    onLog(`📋 Daily index: ${filings.length} Form 4 filings found`);
+    return filings;
+  }
+
+  // Fallback: quarterly index
+  onLog("⚠️  Daily index unavailable — trying quarterly index...");
+  const { year, quarter } = getQuarterDates(today);
+  const quarterly = await fetchQuarterlyIndex(year, quarter, cutoff);
+  if (quarterly.length > 0) {
+    onLog(`📋 Quarterly index: ${quarterly.length} Form 4 filings found`);
+    return quarterly;
+  }
+
+  // Last resort: EFTS search
+  onLog("⚠️  Quarterly index failed — trying EFTS search API...");
+  const eftsResults = await getCIKsFromEFTS(startDate);
+  if (eftsResults.length > 0) {
+    onLog(`📋 EFTS: ${eftsResults.length} results found`);
+    return eftsResults;
+  }
+
+  throw new Error(
+    "All EDGAR data sources failed. This is likely a CORS proxy issue — " +
+      "try opening the browser console (F12 → Network) to see which requests are blocked.",
+  );
+}
+
+// ── Submissions & facts (direct fetch — data.sec.gov supports CORS) ───────────
 
 export async function fetchSubmissions(cik) {
   try {
-    const paddedCik = String(cik).padStart(10, "0");
-    return await edgarGet(`${EDGAR_BASE}/submissions/CIK${paddedCik}.json`);
+    const padded = String(cik).padStart(10, "0");
+    return await edgarJson(`${EDGAR_BASE}/submissions/CIK${padded}.json`);
   } catch {
     return null;
   }
@@ -99,47 +227,25 @@ export async function fetchSubmissions(cik) {
 
 export async function fetchCompanyFacts(cik) {
   try {
-    const paddedCik = String(cik).padStart(10, "0");
-    return await edgarGet(
-      `${EDGAR_BASE}/api/xbrl/companyfacts/CIK${paddedCik}.json`,
+    const padded = String(cik).padStart(10, "0");
+    return await edgarJson(
+      `${EDGAR_BASE}/api/xbrl/companyfacts/CIK${padded}.json`,
     );
   } catch {
     return null;
   }
 }
 
-// ── Extract Form 4 filings from submissions data ──────────────────────────────
-
-export function extractForm4Filings(subData, cutoffDate) {
-  const filings = subData?.filings?.recent;
-  if (!filings) return [];
-
-  const results = [];
-  const forms = filings.form || [];
-  for (let i = 0; i < forms.length; i++) {
-    if (forms[i] !== "4") continue;
-    const fileDate = filings.filingDate?.[i];
-    if (!fileDate || new Date(fileDate) < cutoffDate) continue;
-    const accNum = filings.accessionNumber?.[i];
-    if (!accNum) continue;
-    results.push({ accessionNumber: accNum, filingDate: fileDate });
-  }
-  return results;
-}
-
-// ── Parse Form 4 XML text → structured purchase data ─────────────────────────
-// Returns null if no Code P (open-market purchase) transactions found
+// ── Form 4 XML parsing ────────────────────────────────────────────────────────
 
 export function parseForm4XML(xmlText) {
   try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(xmlText, "text/xml");
-
+    const doc = new DOMParser().parseFromString(xmlText, "text/xml");
     const purchases = [];
-    doc.querySelectorAll("nonDerivativeTransaction").forEach((t) => {
-      const code = t.querySelector("transactionCode")?.textContent?.trim();
-      if (code !== "P") return;
 
+    doc.querySelectorAll("nonDerivativeTransaction").forEach((t) => {
+      if (t.querySelector("transactionCode")?.textContent?.trim() !== "P")
+        return;
       const shares = parseFloat(
         t.querySelector("transactionShares value")?.textContent || "0",
       );
@@ -153,7 +259,6 @@ export function parseForm4XML(xmlText) {
         t.querySelector("sharesOwnedFollowingTransaction value")?.textContent ||
           "0",
       );
-
       if (shares > 0 && price > 0) {
         purchases.push({
           shares,
@@ -165,18 +270,17 @@ export function parseForm4XML(xmlText) {
       }
     });
 
-    if (purchases.length === 0) return null;
+    if (!purchases.length) return null;
 
-    const getText = (sel) => doc.querySelector(sel)?.textContent?.trim() || "";
-
+    const g = (sel) => doc.querySelector(sel)?.textContent?.trim() || "";
     return {
-      issuer: getText("issuerName"),
-      ticker: getText("issuerTradingSymbol"),
-      cik: getText("issuerCik"),
-      insiderName: getText("rptOwnerName"),
-      insiderTitle: getText("officerTitle"),
-      isOfficer: getText("isOfficer") === "1",
-      isDirector: getText("isDirector") === "1",
+      issuer: g("issuerName"),
+      ticker: g("issuerTradingSymbol").toUpperCase(),
+      cik: g("issuerCik"),
+      insiderName: g("rptOwnerName"),
+      insiderTitle: g("officerTitle"),
+      isOfficer: g("isOfficer") === "1",
+      isDirector: g("isDirector") === "1",
       purchases,
       totalValue: purchases.reduce((s, p) => s + p.value, 0),
       totalShares: purchases.reduce((s, p) => s + p.shares, 0),
@@ -186,38 +290,31 @@ export function parseForm4XML(xmlText) {
   }
 }
 
-// ── Try multiple URL patterns to fetch and parse one Form 4 ──────────────────
+async function fetchForm4XML(cik, accNoHyphens, accWithHyphens) {
+  const base = `https://www.sec.gov/Archives/edgar/data/${cik}/${accNoHyphens}`;
 
-async function fetchAndParseFormByIndex(cik, accNoHyphens, accWithHyphens) {
-  const baseUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${accNoHyphens}`;
-
-  // Pattern 1: direct named XML
   try {
-    const text = await proxyGet(`${baseUrl}/${accWithHyphens}.xml`);
-    if (text && text.includes("<ownershipDocument>"))
-      return parseForm4XML(text);
+    const text = await proxyFetch(`${base}/${accWithHyphens}.xml`);
+    if (text?.includes("<ownershipDocument>")) return parseForm4XML(text);
   } catch {
     /* try next */
   }
 
-  // Pattern 2: scan the index page for an XML file
   try {
-    const indexHtml = await proxyGet(`${baseUrl}/`);
-    const match = indexHtml.match(/href="([^"]*\.xml)"/i);
+    const index = await proxyFetch(`${base}/`);
+    const match = index?.match(/href="([^"]+\.xml)"/i);
     if (match) {
-      const xmlFile = match[1].split("/").pop();
-      const text = await proxyGet(`${baseUrl}/${xmlFile}`);
-      if (text && text.includes("<ownershipDocument>"))
-        return parseForm4XML(text);
+      const file = match[1].split("/").pop();
+      const text = await proxyFetch(`${base}/${file}`);
+      if (text?.includes("<ownershipDocument>")) return parseForm4XML(text);
     }
   } catch {
     /* try next */
   }
 
-  // Pattern 3: .txt primary document
   try {
-    const text = await proxyGet(`${baseUrl}/${accWithHyphens}.txt`);
-    if (text && text.includes("transactionCode")) return parseForm4XML(text);
+    const text = await proxyFetch(`${base}/${accWithHyphens}.txt`);
+    if (text?.includes("transactionCode")) return parseForm4XML(text);
   } catch {
     /* give up */
   }
@@ -225,94 +322,80 @@ async function fetchAndParseFormByIndex(cik, accNoHyphens, accWithHyphens) {
   return null;
 }
 
-// ── Main scanner: returns purchasesByTicker map ───────────────────────────────
-// { ticker → { name, cik, filings: [parsedForm4] } }
+// ── Main scanner ──────────────────────────────────────────────────────────────
 
 export async function scanCodePPurchases({
   startDate,
-  maxCiks = 100,
+  maxCiks = 200,
   onProgress,
   onLog,
 }) {
-  onLog("📡 Fetching recent Form 4 filer list from EDGAR...");
+  // Step 1: Get all Form 4 filings from index files
+  const allFilings = await getRecentForm4Filings(startDate, onLog);
 
-  // Get CIK list from EDGAR browse page (most reliable source)
-  let ciks = [];
-  try {
-    const rssUrl =
-      "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=100&search_text=";
-    const html = await proxyGet(rssUrl);
-    const matches = [...html.matchAll(/CIK=(\d+)/g)];
-    ciks = [...new Set(matches.map((m) => m[1]))].slice(0, maxCiks);
-    onLog(`📋 ${ciks.length} CIKs from EDGAR browse`);
-  } catch (e) {
-    onLog(`⚠️  Browse blocked (${e.message}), falling back to EFTS...`);
-    try {
-      const url = `${EDGAR_SEARCH}?forms=4&dateRange=custom&startdt=${startDate}`;
-      const data = await edgarGet(url);
-      const hits = data?.hits?.hits || [];
-      // Extract CIKs from entity_id field
-      ciks = [
-        ...new Set(
-          hits.flatMap((h) => {
-            const id = h._source?.entity_id;
-            return id ? [String(id)] : [];
-          }),
-        ),
-      ].slice(0, maxCiks);
-      onLog(`📋 ${ciks.length} CIKs from EFTS fallback`);
-    } catch {
-      throw new Error(
-        "Could not retrieve CIKs from EDGAR — check your network connection",
-      );
-    }
+  // Deduplicate by CIK — group accession numbers per CIK
+  const byCik = {};
+  for (const f of allFilings) {
+    if (!f.cik) continue;
+    if (!byCik[f.cik])
+      byCik[f.cik] = { cik: f.cik, company: f.company, filings: [] };
+    byCik[f.cik].filings.push({
+      accessionNumber: f.accessionNumber,
+      filingDate: f.filingDate,
+    });
   }
 
-  const cutoffDate = new Date(startDate);
-  const purchasesByTicker = {};
+  const ciks = Object.keys(byCik).slice(0, maxCiks);
+  onLog(
+    `🔍 Parsing Form 4 XML for ${ciks.length} filers (looking for Code P)...`,
+  );
+
+  const byTicker = {};
+  let parsed = 0;
+  let codePFound = 0;
 
   for (let i = 0; i < ciks.length; i++) {
-    onProgress(Math.round((i / ciks.length) * 65));
+    onProgress(Math.round((i / ciks.length) * 60) + 10);
     const cik = ciks[i];
+    const entry = byCik[cik];
 
-    try {
-      const subData = await fetchSubmissions(cik);
-      if (!subData) continue;
+    for (const filing of entry.filings.slice(0, 2)) {
+      const accRaw = filing.accessionNumber.replace(/-/g, "");
+      const accFmt = filing.accessionNumber.includes("-")
+        ? filing.accessionNumber
+        : `${accRaw.slice(0, 10)}-${accRaw.slice(10, 12)}-${accRaw.slice(12)}`;
 
-      const ticker = subData.tickers?.[0];
-      if (!ticker) continue;
+      try {
+        const form4 = await fetchForm4XML(cik, accRaw, accFmt);
+        parsed++;
+        if (!form4) continue;
 
-      const recentForm4s = extractForm4Filings(subData, cutoffDate);
-      if (recentForm4s.length === 0) continue;
+        codePFound++;
+        const ticker = form4.ticker || entry.company;
+        if (!ticker) continue;
 
-      for (const filing of recentForm4s.slice(0, 4)) {
-        const accRaw = filing.accessionNumber.replace(/-/g, "");
-        const accFmt = filing.accessionNumber.includes("-")
-          ? filing.accessionNumber
-          : `${accRaw.slice(0, 10)}-${accRaw.slice(10, 12)}-${accRaw.slice(12)}`;
-
-        const parsed = await fetchAndParseFormByIndex(cik, accRaw, accFmt);
-        if (!parsed) continue;
-
-        if (!purchasesByTicker[ticker]) {
-          purchasesByTicker[ticker] = {
+        if (!byTicker[ticker]) {
+          byTicker[ticker] = {
             ticker,
-            name: subData.name,
+            name: form4.issuer || entry.company,
             cik,
             filings: [],
           };
         }
-        purchasesByTicker[ticker].filings.push({
-          ...parsed,
+        byTicker[ticker].filings.push({
+          ...form4,
           filingDate: filing.filingDate,
         });
+      } catch {
+        /* skip */
       }
-    } catch {
-      // Skip silently — individual CIK failures are expected
-    }
 
-    await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 80));
+    }
   }
 
-  return purchasesByTicker;
+  onLog(
+    `📊 Parsed ${parsed} filings — ${codePFound} had Code P purchases across ${Object.keys(byTicker).length} tickers`,
+  );
+  return byTicker;
 }
